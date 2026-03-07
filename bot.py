@@ -425,7 +425,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
 
-    logger.info("Bot is running…")
+    logger.info("Bot v2 (з Іграшками) running…")
     app.run_polling(drop_pending_updates=True)
 
 
