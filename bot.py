@@ -395,6 +395,7 @@ def main():
     app = Application.builder().token(token).build()
 
     conv = ConversationHandler(
+        per_message=False,
         entry_points=[
             # Triggered by /add command OR the persistent bottom button
             CommandHandler("add", add_expense),
