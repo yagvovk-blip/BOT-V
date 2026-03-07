@@ -46,16 +46,17 @@ CATEGORY, ARTICLE, AMOUNT, NEXT_ACTION = range(4)
 CATEGORIES = [
     "Продукти",
     "Заклади",
-    "Обіди на роботі",
-    "Одяг",
-    "Навчання",
-    "Здоров'я",
-    "Квартира",
-    "Відпочинок",
     "Проїзд",
+    "Квартира",
+    "Здоров'я",
+    "Іграшки",
     "Подарунки",
     "Телефон, інтернет",
+    "Одяг",
+    "Навчання",
+    "Відпочинок",
     "Обладнання",
+    "Обіди на роботі",
     "Інше",
 ]
 
@@ -189,14 +190,23 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     idx = int(query.data.split("_")[1])
-    context.user_data["category"] = CATEGORIES[idx]
+    category = CATEGORIES[idx]
+    context.user_data["category"] = category
 
-    await query.edit_message_text(
-        f"✅ Категорія: *{CATEGORIES[idx]}*\n\n"
-        "📝 Введіть *стаття* — короткий опис витрати.\n"
-        "Або надішліть /skip, щоб стаття збіглася з категорією.",
-        parse_mode="Markdown",
-    )
+    if category == "Інше":
+        await query.edit_message_text(
+            f"✅ Категорія: *{category}*\n\n"
+            "📝 Введіть *стаття* — короткий опис витрати.\n"
+            "⚠️ Для категорії «Інше» опис обов'язковий.",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.edit_message_text(
+            f"✅ Категорія: *{category}*\n\n"
+            "📝 Введіть *стаття* — короткий опис витрати.\n"
+            "Або надішліть /skip, щоб стаття збіглася з категорією.",
+            parse_mode="Markdown",
+        )
     return ARTICLE
 
 
@@ -206,6 +216,15 @@ async def article_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def article_skipped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # For "Інше" category, article is mandatory — block skip
+    if context.user_data.get("category") == "Інше":
+        await update.message.reply_text(
+            "⚠️ Для категорії *«Інше»* стаття обов'язкова.\n"
+            "Будь ласка, введіть короткий опис витрати.",
+            parse_mode="Markdown",
+        )
+        return ARTICLE
+
     context.user_data["article"] = context.user_data["category"]
     return await _ask_amount(update, context)
 
@@ -217,8 +236,16 @@ async def _ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ Стаття: *{art}*{note}\n\n"
-        "💰 Введіть *суму та валюту* через пробіл:\n"
-        "`500 UAH`  ·  `50 EUR`  ·  `100 USD`  ·  `200 PLN`",
+        "💰 Введіть *суму* та, за потреби, *валюту* через пробіл.\n"
+        "Якщо валюту не вказати — буде EUR.\n\n"
+        "*Приклади:*\n"
+        "`500 UAH` — гривня\n"
+        "`50` або `50 EUR` — євро\n"
+        "`100 USD` — долар США\n"
+        "`200 PLN` — польський злотий\n"
+        "`150 GBP` — британський фунт\n"
+        "`120 CHF` — швейцарський франк\n"
+        "`80 CZK` — чеська крона",
         parse_mode="Markdown",
     )
     return AMOUNT
@@ -226,13 +253,13 @@ async def _ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    # split() handles any number of spaces between tokens
     parts = text.split()
 
     # ── Validate ──────────────────────────────────────────────────────────────
-    if len(parts) != 2:
+    if len(parts) == 0:
         await update.message.reply_text(
-            "❌ Невірний формат.\n"
-            "Введіть суму і валюту через пробіл, наприклад: `500 UAH`",
+            "❌ Введіть суму, наприклад: `500 UAH` або просто `50`",
             parse_mode="Markdown",
         )
         return AMOUNT
@@ -241,12 +268,16 @@ async def amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(parts[0].replace(",", "."))
     except ValueError:
         await update.message.reply_text(
-            "❌ Невірна сума. Спробуйте ще раз: `500 UAH`",
+            "❌ Невірна сума. Спробуйте: `500 UAH` або `50`",
             parse_mode="Markdown",
         )
         return AMOUNT
 
-    currency = parts[1].upper()
+    # If currency not provided — default to EUR
+    if len(parts) >= 2:
+        currency = parts[1].upper()
+    else:
+        currency = "EUR"
 
     # ── Convert to EUR ────────────────────────────────────────────────────────
     status_msg = await update.message.reply_text("⏳ Отримую курс валюти…")
