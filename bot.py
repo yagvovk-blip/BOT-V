@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Expense Tracker Bot v4.3
+Telegram Expense Tracker Bot v4.4
 ────────────────────────────────────────────────────────────────────────────────
 • MAIN_KEYBOARD завжди видима — CANCEL_KEYBOARD не використовується
 • Сервісні повідомлення видаляються після запису суми (кінець add-flow)
@@ -122,6 +122,21 @@ def _get_sheet():
         })
     elif len(headers) < 8 or headers[7] != "ID":
         ws.update_cell(1, 8, "ID")
+
+    # Формула накопичувальної суми за поточний місяць у клітинці J1 (встановлюється один раз)
+    try:
+        j1_val = ws.acell("J1").value
+        if not j1_val or not str(j1_val).strip():
+            formula = (
+                "=SUMPRODUCT("
+                "(MONTH(DATEVALUE(IF(A2:A10000<>\"\",A2:A10000,\"1.1.2000\")))=MONTH(TODAY()))*"
+                "(YEAR(DATEVALUE(IF(A2:A10000<>\"\",A2:A10000,\"1.1.2000\")))=YEAR(TODAY()))*"
+                "(ISNUMBER(G2:G10000))*(G2:G10000))"
+            )
+            ws.update_acell("J1", formula)
+    except Exception as exc:
+        logger.warning("J1 formula setup error: %s", exc)
+
     return ws
 
 
@@ -191,6 +206,21 @@ async def sheet_update(ws, range_name: str, values: list):
 
 async def sheet_delete_row(ws, row_num: int):
     await asyncio.to_thread(ws.delete_rows, row_num)
+
+
+def _monthly_total_sync(ws) -> str:
+    """Читає накопичувальну суму за поточний місяць з клітинки J1 (формула в Sheets)."""
+    try:
+        val = ws.acell("J1").value
+        if val is not None and str(val).strip():
+            return f"{float(str(val).replace(',', '.')):.2f}"
+    except Exception as exc:
+        logger.warning("monthly_total read error: %s", exc)
+    return "—"
+
+
+async def monthly_total(ws) -> str:
+    return await asyncio.to_thread(_monthly_total_sync, ws)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -433,9 +463,13 @@ async def add_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Видаляємо ВСІ сервісні повідомлення після успішного запису
         await _cleanup(context)
 
+        # Накопичувальна сума за поточний місяць
+        month_str = await monthly_total(ws)
+
         # Єдиний результат — залишається в чаті
         await update.message.reply_text(
-            fmt(expense_id, category, article, amount, currency),
+            fmt(expense_id, category, article, amount, currency)
+            + f"\n📊 За місяць: {month_str} EUR",
             parse_mode="Markdown",
             reply_markup=build_add_next_keyboard(),
         )
@@ -597,6 +631,9 @@ async def edit_choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             line = fmt_edited(exp_id, ed["edit_category"], ed["edit_article"], amount_val, currency)
 
+            # Накопичувальна сума за поточний місяць (після оновлення)
+            month_str = await monthly_total(ws)
+
             # Видаляємо сервісні (включно з полем вибору)
             await _cleanup(context)
             _clear_edit(context)
@@ -604,7 +641,7 @@ async def edit_choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # Результат залишається в чаті + відновлює MAIN_KEYBOARD
             await context.bot.send_message(
                 chat_id,
-                line,
+                line + f"\n📊 За місяць: {month_str} EUR",
                 parse_mode="Markdown",
                 reply_markup=MAIN_KEYBOARD,
             )
@@ -831,12 +868,16 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         row_num = await asyncio.to_thread(_find_row, ws, expense_id)
         if row_num:
             await sheet_delete_row(ws, row_num)
-            result_text = fmt_deleted_html(
-                expense_id,
-                row[2] if len(row) > 2 else "",
-                row[3] if len(row) > 3 else "",
-                row[4] if len(row) > 4 else "",
-                row[5] if len(row) > 5 else "EUR",
+            month_str = await monthly_total(ws)
+            result_text = (
+                fmt_deleted_html(
+                    expense_id,
+                    row[2] if len(row) > 2 else "",
+                    row[3] if len(row) > 3 else "",
+                    row[4] if len(row) > 4 else "",
+                    row[5] if len(row) > 5 else "EUR",
+                )
+                + f"\n📊 За місяць: {month_str} EUR"
             )
         else:
             result_text = f"⚠️ <i>(ID: {expense_id})</i> вже не існує"
@@ -929,7 +970,7 @@ def main():
     app.add_handler(edit_conv)
     app.add_handler(del_conv)
 
-    logger.info("Bot v4.3 running…")
+    logger.info("Bot v4.4 running…")
     app.run_polling(drop_pending_updates=True)
 
 
