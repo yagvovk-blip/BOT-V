@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Expense Tracker Bot v4.4
+Telegram Expense Tracker Bot v4.5
 ────────────────────────────────────────────────────────────────────────────────
 • MAIN_KEYBOARD завжди видима — CANCEL_KEYBOARD не використовується
 • Сервісні повідомлення видаляються після запису суми (кінець add-flow)
@@ -15,8 +15,9 @@ import os
 import json
 import logging
 import requests
+from collections import defaultdict
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import (
     Update,
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 ADD_CATEGORY, ADD_ARTICLE, ADD_AMOUNT, ADD_NEXT        = range(4)
 EDIT_WAIT_ID, EDIT_CHOOSE_FIELD, EDIT_CAT, EDIT_ART, EDIT_AMT = range(4, 9)
 DEL_WAIT_ID, DEL_CONFIRM                               = range(9, 11)
+REP_TYPE, REP_PERIOD, REP_DAY, REP_DATE                = range(11, 15)
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
 CATEGORIES = [
@@ -123,17 +125,32 @@ def _get_sheet():
     elif len(headers) < 8 or headers[7] != "ID":
         ws.update_cell(1, 8, "ID")
 
-    # Формула накопичувальної суми за поточний місяць у клітинці J1 (встановлюється один раз)
+    # ── Колонка I: підсумок місяця для кожного рядка (ARRAYFORMULA, auto-fill) ──
     try:
-        j1_val = ws.acell("J1").value
-        if not j1_val or not str(j1_val).strip():
-            formula = (
-                "=SUMPRODUCT("
-                "(MONTH(DATEVALUE(IF(A2:A10000<>\"\",A2:A10000,\"1.1.2000\")))=MONTH(TODAY()))*"
-                "(YEAR(DATEVALUE(IF(A2:A10000<>\"\",A2:A10000,\"1.1.2000\")))=YEAR(TODAY()))*"
-                "(ISNUMBER(G2:G10000))*(G2:G10000))"
+        i1_val = str(ws.acell("I1").value or "").strip()
+        if not i1_val:
+            ws.update_acell("I1", "Місяць (EUR)")
+        i2_val = str(ws.acell("I2").value or "").strip()
+        if not i2_val or "#" in i2_val:
+            ws.update_acell(
+                "I2",
+                '=ARRAYFORMULA(IF(A2:A10000="","",SCAN(0,IF((MID(A2:A10000,4,2)=TEXT(TODAY(),"MM"))*(RIGHT(A2:A10000,4)=TEXT(TODAY(),"YYYY")),IF(ISNUMBER(G2:G10000),G2:G10000,0),0),LAMBDA(acc,v,acc+v))))',
             )
-            ws.update_acell("J1", formula)
+    except Exception as exc:
+        logger.warning("Column I formula setup error: %s", exc)
+
+    # ── J1: загальна сума за поточний місяць (читається ботом) ────────────────
+    # Використовує MID/RIGHT для витягання місяця/року з тексту "DD.MM.YYYY"
+    # (DATEVALUE не підтримується в усіх локалях через API)
+    try:
+        j1_val = str(ws.acell("J1").value or "").strip()
+        if not j1_val or "#" in j1_val:
+            ws.update_acell(
+                "J1",
+                '=SUMPRODUCT((MID(A2:A10000,4,2)=TEXT(TODAY(),"MM"))'
+                '*(RIGHT(A2:A10000,4)=TEXT(TODAY(),"YYYY"))'
+                '*(ISNUMBER(G2:G10000)*G2:G10000))',
+            )
     except Exception as exc:
         logger.warning("J1 formula setup error: %s", exc)
 
@@ -301,7 +318,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Привіт! Я бот для обліку витрат.*\n\n"
         "➕ *Додати витрату* — записати нову\n"
         "✏️ *Змінити витрату* — відредагувати за ID\n"
-        "🗑️ *Видалити витрату* — видалити за ID\n\n"
+        "🗑️ *Видалити витрату* — видалити за ID\n"
+        "/rep — звіт за день або місяць\n\n"
         "На будь-якому кроці /cancel для скасування.",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
@@ -902,6 +920,207 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# REPORT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MONTHS_UK = {
+    "01": "Січень",   "02": "Лютий",    "03": "Березень", "04": "Квітень",
+    "05": "Травень",  "06": "Червень",  "07": "Липень",   "08": "Серпень",
+    "09": "Вересень", "10": "Жовтень",  "11": "Листопад", "12": "Грудень",
+}
+
+
+def _cur_month_year() -> str:
+    """'MM.YYYY' поточного місяця."""
+    return datetime.now().strftime("%m.%Y")
+
+
+def _prev_month_year() -> str:
+    """'MM.YYYY' попереднього місяця."""
+    first = datetime.now().replace(day=1)
+    return (first - timedelta(days=1)).strftime("%m.%Y")
+
+
+def _month_title(mm_yyyy: str) -> str:
+    """'MM.YYYY' → 'Березень 2026'."""
+    mm, yyyy = mm_yyyy.split(".")
+    return f"{_MONTHS_UK.get(mm, mm)} {yyyy}"
+
+
+def _filter_by_month(rows: list, mm_yyyy: str) -> list:
+    """Рядки, де A (DD.MM.YYYY) відповідає місяцю 'MM.YYYY'."""
+    return [r for r in rows if len(r) > 0 and len(r[0]) >= 10 and r[0][3:10] == mm_yyyy]
+
+
+def _filter_by_date(rows: list, dd_mm_yyyy: str) -> list:
+    """Рядки, де A == 'DD.MM.YYYY'."""
+    return [r for r in rows if len(r) > 0 and r[0] == dd_mm_yyyy]
+
+
+def _build_report(filtered: list, title: str) -> str:
+    """Формує текст звіту: по категоріям + загальна сума."""
+    if not filtered:
+        return f"📊 *{title}*\n\nНемає витрат за цей період."
+
+    by_cat: dict = defaultdict(float)
+    total = 0.0
+    for row in filtered:
+        try:
+            eur = float(str(row[6]).replace(",", "."))
+            cat = row[2] if len(row) > 2 else "Інше"
+            by_cat[cat] += eur
+            total += eur
+        except (ValueError, IndexError):
+            pass
+
+    lines = [f"📊 *{title}*\n"]
+    for cat in sorted(by_cat):
+        lines.append(f"📂 {cat} — {by_cat[cat]:.2f} EUR")
+    lines.append("─────────────────")
+    lines.append(f"💰 *Разом: {total:.2f} EUR*")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORT FLOW  (/rep)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def rep_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "📊 *Звіт* — оберіть тип:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📆 Звіт за період", callback_data="rep_period")],
+            [InlineKeyboardButton("📅 Звіт за день",   callback_data="rep_day")],
+            [InlineKeyboardButton("❌ Скасувати",       callback_data="rep_cancel")],
+        ]),
+    )
+    return REP_TYPE
+
+
+async def rep_type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "rep_cancel":
+        await query.edit_message_text("❌ Скасовано.")
+        return ConversationHandler.END
+
+    if query.data == "rep_period":
+        await query.edit_message_text(
+            "📆 *Звіт за місяць* — оберіть період:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 Поточний місяць",    callback_data="repm_cur")],
+                [InlineKeyboardButton("◀️ Попередній місяць",  callback_data="repm_prev")],
+                [InlineKeyboardButton("❌ Скасувати",           callback_data="rep_cancel")],
+            ]),
+        )
+        return REP_PERIOD
+
+    # rep_day
+    await query.edit_message_text(
+        "📅 *Звіт за день* — оберіть дату:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📍 Сьогодні",    callback_data="repd_today")],
+            [InlineKeyboardButton("◀️ Вчора",       callback_data="repd_yesterday")],
+            [InlineKeyboardButton("🗓 Ввести дату", callback_data="repd_custom")],
+            [InlineKeyboardButton("❌ Скасувати",    callback_data="rep_cancel")],
+        ]),
+    )
+    return REP_DAY
+
+
+async def rep_period_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "rep_cancel":
+        await query.edit_message_text("❌ Скасовано.")
+        return ConversationHandler.END
+
+    mm_yyyy = _cur_month_year() if query.data == "repm_cur" else _prev_month_year()
+    title   = _month_title(mm_yyyy)
+    await query.edit_message_text("⏳ Формую звіт…")
+
+    try:
+        ws       = await get_sheet()
+        all_rows = await asyncio.to_thread(ws.get_all_values)
+        filtered = _filter_by_month(all_rows[1:], mm_yyyy)
+        text     = _build_report(filtered, title)
+    except Exception as exc:
+        logger.error("rep_period error: %s", exc)
+        text = "❌ Помилка отримання даних."
+
+    await query.edit_message_text(text, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+async def rep_day_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "rep_cancel":
+        await query.edit_message_text("❌ Скасовано.")
+        return ConversationHandler.END
+
+    if query.data == "repd_custom":
+        await query.edit_message_text(
+            "🗓 Введіть дату у форматі `ДД.ММ.РРРР`\n"
+            "Наприклад: `07.03.2026`",
+            parse_mode="Markdown",
+        )
+        return REP_DATE
+
+    now = datetime.now()
+    target    = now if query.data == "repd_today" else now - timedelta(days=1)
+    date_str  = target.strftime("%d.%m.%Y")
+    await query.edit_message_text("⏳ Формую звіт…")
+
+    try:
+        ws       = await get_sheet()
+        all_rows = await asyncio.to_thread(ws.get_all_values)
+        filtered = _filter_by_date(all_rows[1:], date_str)
+        text     = _build_report(filtered, date_str)
+    except Exception as exc:
+        logger.error("rep_day error: %s", exc)
+        text = "❌ Помилка отримання даних."
+
+    await query.edit_message_text(text, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+async def rep_date_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+
+    try:
+        dt       = datetime.strptime(raw, "%d.%m.%Y")
+        date_str = dt.strftime("%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Невірний формат. Введіть як `ДД.ММ.РРРР`\n"
+            "Наприклад: `07.03.2026`",
+            parse_mode="Markdown",
+        )
+        return REP_DATE
+
+    wait = await update.message.reply_text("⏳ Формую звіт…")
+
+    try:
+        ws       = await get_sheet()
+        all_rows = await asyncio.to_thread(ws.get_all_values)
+        filtered = _filter_by_date(all_rows[1:], date_str)
+        text     = _build_report(filtered, date_str)
+    except Exception as exc:
+        logger.error("rep_date error: %s", exc)
+        text = "❌ Помилка отримання даних."
+
+    await wait.edit_text(text, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -965,12 +1184,25 @@ def main():
         fallbacks=_fallbacks,
     )
 
+    rep_conv = ConversationHandler(
+        per_message=False,
+        entry_points=[CommandHandler("rep", rep_start)],
+        states={
+            REP_TYPE:   [CallbackQueryHandler(rep_type_chosen,   pattern=r"^rep_(period|day|cancel)$")],
+            REP_PERIOD: [CallbackQueryHandler(rep_period_chosen, pattern=r"^(repm_(cur|prev)|rep_cancel)$")],
+            REP_DAY:    [CallbackQueryHandler(rep_day_chosen,    pattern=r"^(repd_(today|yesterday|custom)|rep_cancel)$")],
+            REP_DATE:   [MessageHandler(_TEXT, rep_date_entered)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(add_conv)
     app.add_handler(edit_conv)
     app.add_handler(del_conv)
+    app.add_handler(rep_conv)
 
-    logger.info("Bot v4.4 running…")
+    logger.info("Bot v4.5 running…")
     app.run_polling(drop_pending_updates=True)
 
 
